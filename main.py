@@ -16,12 +16,13 @@ LOG_REQUESTS = os.getenv("LOG_REQUESTS", "false").lower() == "true"
 SAVE_LAST_RESPONSE = os.getenv("SAVE_LAST_RESPONSE", "false").lower() == "true"
 
 # ========== Env & Config ==========
-DATA_PROVIDER = os.getenv("DATA_PROVIDER", "binance")
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.binance.com")
+DATA_PROVIDER = os.getenv("DATA_PROVIDER", "coinbase_exchange")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://api.exchange.coinbase.com")
 API_TIMEOUT = float(os.getenv("API_TIMEOUT", "5"))
 
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-SYMBOL_HUMAN = os.getenv("SYMBOL_HUMAN", "BTC-USD")
+# Coinbase product_id format: e.g. BTC-USD, ETH-USD
+SYMBOL = os.getenv("SYMBOL", "BTC-USD")
+SYMBOL_HUMAN = os.getenv("SYMBOL_HUMAN", SYMBOL)
 
 FETCH_INTERVAL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", "30"))
 ENABLE_WORKER_LOOP = os.getenv("ENABLE_WORKER_LOOP", "true").lower() == "true"
@@ -61,31 +62,55 @@ INTERVAL_CONFIGS = load_intervals_from_env()
 
 # Global in-memory candle cache
 CANDLE_CACHE: Dict[str, Dict[str, Any]] = {}
-LAST_FULL_RESPONSE: Dict[str, Any] = {}  # optional raw storage if enabled
+LAST_FULL_RESPONSE: Dict[str, Any] = {}
 LAST_FETCH_TIME: float = 0.0
 
-app = FastAPI(title="BTC Candle Service", version="1.0.0")
+app = FastAPI(title="BTC Candle Service (Coinbase)", version="1.0.0")
 
 
-# ========== Binance Fetch Logic ==========
+# ========== Coinbase Fetch Logic ==========
 
-def fetch_binance_klines(symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
+def coinbase_granularity_from_interval(interval: str) -> int:
     """
-    Fetch klines from Binance and normalize to:
+    Map our interval strings to Coinbase granularity in seconds.
+    Coinbase Exchange supports: 60, 300, 900, 3600, 21600, 86400.
+    """
+    mapping = {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "1h": 3600,
+        "6h": 21600,
+        "1d": 86400,
+        "1D": 86400,
+    }
+    if interval not in mapping:
+        raise ValueError(f"Unsupported interval for Coinbase: {interval}")
+    return mapping[interval]
+
+
+def fetch_coinbase_candles(symbol: str, interval: str, limit: int) -> List[Dict[str, Any]]:
+    """
+    Fetch candles from Coinbase Exchange and normalize to:
       {
-        "ts": <open time ms>,
+        "ts": <start time in ms>,
         "open": float,
         "high": float,
         "low": float,
         "close": float,
         "volume": float
       }
+
+    Coinbase Exchange /products/{product_id}/candles returns:
+      [ time, low, high, open, close, volume ]
+    typically newest → oldest.
     """
-    url = f"{API_BASE_URL}/api/v3/klines"
+    granularity = coinbase_granularity_from_interval(interval)
+
+    url = f"{API_BASE_URL}/products/{symbol}/candles"
     params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
+        "granularity": granularity,
+        # Coinbase does not support a 'limit' param here — we slice locally.
     }
 
     if LOG_REQUESTS:
@@ -94,53 +119,57 @@ def fetch_binance_klines(symbol: str, interval: str, limit: int) -> List[Dict[st
     try:
         resp = requests.get(url, params=params, timeout=API_TIMEOUT)
     except Exception as e:
-        logger.error(f"Error calling Binance: {e}")
+        logger.error(f"Error calling Coinbase: {e}")
         raise
 
     if resp.status_code != 200:
-        logger.error(f"Non-200 from Binance: {resp.status_code} {resp.text}")
+        logger.error(f"Non-200 from Coinbase: {resp.status_code} {resp.text}")
         raise HTTPException(
             status_code=502,
-            detail=f"Binance API error {resp.status_code}"
+            detail=f"Coinbase API error {resp.status_code}"
         )
 
     data = resp.json()
 
     if not isinstance(data, list):
-        logger.error(f"Unexpected Binance response format: {data}")
+        logger.error(f"Unexpected Coinbase response format: {data}")
         raise HTTPException(
             status_code=502,
-            detail="Unexpected Binance response format"
+            detail="Unexpected Coinbase response format"
         )
 
-    normalized = []
-    for item in data:
-        # Binance kline format:
-        # [
-        #   0 open time (ms),
-        #   1 open,
-        #   2 high,
-        #   3 low,
-        #   4 close,
-        #   5 volume,
-        #   ...
-        # ]
+    # Data is usually newest → oldest; sort ascending by time,
+    # then take the last `limit` candles.
+    try:
+        rows_sorted = sorted(data, key=lambda x: x[0])
+    except Exception as e:
+        logger.error(f"Failed to sort Coinbase candles: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to parse Coinbase candles"
+        )
+
+    rows = rows_sorted[-limit:]
+
+    normalized: List[Dict[str, Any]] = []
+    for item in rows:
+        # [ time, low, high, open, close, volume ]
         try:
-            open_time = int(item[0])
-            open_price = float(item[1])
-            high_price = float(item[2])
-            low_price = float(item[3])
+            t = int(item[0])  # seconds
+            low = float(item[1])
+            high = float(item[2])
+            open_price = float(item[3])
             close_price = float(item[4])
             volume = float(item[5])
         except (ValueError, TypeError, IndexError) as e:
-            logger.warning(f"Failed to parse kline item: {item} ({e})")
+            logger.warning(f"Failed to parse Coinbase candle: {item} ({e})")
             continue
 
         normalized.append({
-            "ts": open_time,
+            "ts": t * 1000,  # convert to ms for consistency
             "open": open_price,
-            "high": high_price,
-            "low": low_price,
+            "high": high,
+            "low": low,
             "close": close_price,
             "volume": volume,
         })
@@ -165,7 +194,7 @@ def refresh_all_candles():
         limit = cfg["limit"]
 
         try:
-            candles = fetch_binance_klines(SYMBOL, interval, limit)
+            candles = fetch_coinbase_candles(SYMBOL, interval, limit)
         except HTTPException as he:
             logger.error(f"HTTPException fetching {interval}: {he.detail}")
             continue
@@ -219,7 +248,7 @@ def worker_loop():
 
 @app.on_event("startup")
 def on_startup():
-    logger.info("Starting BTC Candle Service...")
+    logger.info("Starting BTC Candle Service (Coinbase)...")
 
     # Initial fetch so /candles has data on first request
     try:
@@ -264,7 +293,6 @@ def get_candles():
             detail="No intervals configured. Check INTERVAL_1..4 and CANDLES_1..4.",
         )
 
-    # Ensure we have data
     if not CANDLE_CACHE:
         logger.warning("CANDLE_CACHE empty on /candles request, attempting refresh...")
         try:
@@ -282,10 +310,9 @@ def get_candles():
         cached = CANDLE_CACHE.get(interval)
 
         if not cached:
-            # if one interval is missing, treat as error
             logger.warning(f"No cache for interval {interval}, attempting partial refresh...")
             try:
-                candles = fetch_binance_klines(SYMBOL, interval, cfg["limit"])
+                candles = fetch_coinbase_candles(SYMBOL, interval, cfg["limit"])
                 cached = {
                     "interval": interval,
                     "limit": cfg["limit"],
